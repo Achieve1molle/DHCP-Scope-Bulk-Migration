@@ -1,3 +1,0 @@
-﻿Enabled,Phase,ScopeId,ScopeName,LegacyHub,LegacyEdge,NewHub,NewEdge,ReservePercent,MCLT,TempRelationship,FinalRelationship,BackupRoot,OutputRoot,StopOnValidationFailure
-TRUE,2,192.168.10.0,MigrationTestScope1,2k6EQADHCP02,2k6EdgeDHCP01,2k2EQBDHCP01,2k2EdgeDHCP01,10,0:05:00,EAG-Legacy-EQB-HS,EAG-EQB-2022-HS,C:\DHCPMigration\Backup,C:\DHCPMigration\Results,FALSE
-TRUE,2,192.168.20.0,MigrationTestScope2,2k6EQADHCP02,2k6EdgeDHCP01,2k2EQBDHCP01,2k2EdgeDHCP01,10,0:05:00,EAG-Legacy-EQB-HS,EAG-EQB-2022-HS2,C:\DHCPMigration\Backup,C:\DHCPMigration\Results,FALSE
