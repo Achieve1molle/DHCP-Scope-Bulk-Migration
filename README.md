@@ -1,609 +1,459 @@
-# DHCP Scope Bulk Migration Rev 1.0
 
-Operator-focused PowerShell automation for moving Windows DHCP IPv4 scopes through a controlled, two-phase failover migration while preserving leases, reservations, backups, validation evidence, and resumability.
+# DHCP Scope Bulk Migration Rev 2.4
 
-> **Script file:** `DHCP_Scope_Bulk_Migration_Rev1.0.ps1`  
-> **CSV file:** `DHCP_Scope_Bulk_Migration_Rev1.0.csv`  
-> **PowerShell requirement:** Windows PowerShell 5.1  
-> **Execution model:** Run Phase I on the legacy Edge DHCP server, then run Phase II on the new EQB DHCP server
+Operator-focused PowerShell automation for moving Windows DHCP IPv4 scopes through a controlled, two-phase failover migration while preserving scopes, leases, reservations, backups, validation evidence, and resumability.
 
-> The file names intentionally use `Bilk` because those are the requested release names. Keep the script and CSV file names consistent with this documentation.
+## Release Files
 
----
+- **Script:** `DHCP_Scope_Bulk_Migration_Rev2.4.ps1`
+- **Phase I CSV:** `DHCP_Wave4_Day1_P1_Rev2.4.csv`
+- **Phase II CSV:** `DHCP_Wave4_Day1_P2_Rev2.4.csv`
+- **PowerShell:** Windows PowerShell 5.1
+- **Phase I execution server:** The server specified in `LegacyEdge`
+- **Phase II execution server:** The server specified in `NewHub`
 
-## Overview
+If the downloaded script has a `.txt` suffix, rename it before execution:
 
-`DHCP_Scope_Bulk_Migration_Rev1.0.ps1` automates a staged Windows DHCP failover migration. Each CSV row describes one IPv4 scope and the four DHCP servers involved in the transition:
+```powershell
+Rename-Item `
+    .\DHCP_Scope_Bulk_Migration_Rev2.4.ps1.txt `
+    DHCP_Scope_Bulk_Migration_Rev2.4.ps1
+```
 
-1. Legacy Hub DHCP server
-2. Legacy Edge DHCP server
-3. New EQB DHCP server
-4. New Edge DHCP server
+## Purpose
 
-The migration is divided into two operational phases:
+The script migrates each enabled DHCP scope through two controlled failover transitions:
 
-- **Phase I:** Run locally on the legacy Edge DHCP server. The script removes the scope from the original Legacy Hub and Legacy Edge failover relationship, retains the scope and leases on Legacy Edge, then establishes temporary Hot Standby failover between Legacy Edge and New EQB.
-- **Phase II:** Run locally on the New EQB DHCP server. The script validates or creates a local Phase II lease baseline, removes the temporary Legacy Edge relationship, retains the scope and leases on New EQB, then establishes the final Hot Standby relationship between New EQB and New Edge.
+1. **Phase I:** Remove the scope from the original Legacy Hub and Legacy Edge failover relationship while retaining the scope on Legacy Edge. Then create or reuse a temporary Hot Standby relationship between Legacy Edge and New Hub.
+2. **Phase II:** Remove the scope from the temporary Legacy Edge and New Hub relationship while retaining the scope on New Hub. Then create or reuse the final Hot Standby relationship between New Hub and New Edge.
 
-The script is designed to be resumable. If a previous run completed only part of a phase, a later run detects the current relationship state and continues from the appropriate point instead of assuming every scope is still in its original state.
+Rev 2.4 also supports an environment in which DHCP failover management or partner-status communication is asymmetric. Phase I is intentionally anchored to the retained Legacy Edge and requires only the management direction needed by the workflow.
 
----
+## Environment-Specific Server Mapping
 
-## Key Features
+For the current Nashville migration wave, the required mapping is:
 
-- CSV-driven migration of multiple DHCP IPv4 scopes
-- Two-phase migration with explicit server placement
-- Pre-change and post-change lease validation
-- Reservation exports
-- Local DHCP database backups before relationship changes
-- Temporary and final Hot Standby relationship creation
-- Resume-state detection for partially completed migrations
-- Recovery baseline creation when Phase I files are not available on the Phase II server
-- Unique final relationship-name validation before Phase II changes
-- Existing relationship recovery and validation
-- Per-scope failure evidence
-- Continue-to-next-row behavior after a row-level failure
-- Timestamped logs, comparisons, exports, backups, and summary files
-- `-PreflightOnly`, `-WhatIf`, and `-Confirm` support through PowerShell common parameters
+| CSV column | Server | Purpose |
+|---|---|---|
+| `LegacyHub` | `ALCEQADHCP02` | Original centralized DHCP failover partner that must no longer contain the scope after Phase I detach |
+| `LegacyEdge` | `PMUNSHDHCP01` | Authoritative retained legacy server and Phase I execution server |
+| `NewHub` | `ALCEQBDHCWP01` | Temporary Phase I partner and Phase II execution server |
+| `NewEdge` | `ALCNSHDHCWP01` | Final active Edge partner |
 
----
+> **Critical:** Do not reverse `LegacyHub` and `LegacyEdge`. Phase I must run on `PMUNSHDHCP01`, because the scope must remain on `PMUNSHDHCP01` when the original load-balance failover membership is removed.
+
+## Firewall and Connectivity Constraint
+
+The known condition is asymmetric communication between `ALCEQADHCP02` and edge DHCP servers such as `PMUNSHDHCP01`:
+
+- A failover relationship can exist between the servers.
+- The relationship may report **Normal** when viewed from the edge side.
+- The legacy hub side may show the partner state as **Not available** or **Unknown**.
+- Remote DHCP queries initiated in the hub-to-edge direction may fail.
+- The network path cannot be changed as part of this migration.
+
+Rev 2.4 works around this condition without suppressing placement, lease, or backup safeguards:
+
+- Phase I runs locally on `PMUNSHDHCP01`.
+- Required remote checks are initiated from `PMUNSHDHCP01` toward `ALCEQADHCP02`.
+- Reverse-direction partner-status visibility is not required by the Phase I workflow.
+- A transport failure in the required edge-to-hub direction remains a hard stop.
+- The script proves the scope exists on `PMUNSHDHCP01` and is absent from `ALCEQADHCP02` after detach.
+- The temporary relationship is not created if scope placement cannot be proven.
 
 ## Migration Architecture
 
 ```mermaid
 flowchart LR
-    LH[Legacy Hub DHCP] <-->|Original Load Balance| LE[Legacy Edge DHCP]
-    LE -. Phase I temporary Hot Standby .-> EQB[New EQB DHCP]
-    EQB -. Phase II final Hot Standby .-> NE[New Edge DHCP]
+    LH[Legacy Hub<br/>ALCEQADHCP02]
+    LE[Legacy Edge<br/>PMUNSHDHCP01]
+    NH[New Hub<br/>ALCEQBDHCWP01]
+    NE[New Edge<br/>ALCNSHDHCWP01]
 
-    subgraph P1[Phase I]
-        P1A[Run script on Legacy Edge]
-        P1B[Detach scope from Legacy Hub]
-        P1C[Retain leases on Legacy Edge]
-        P1D[Create temporary Hot Standby to New EQB]
-        P1A --> P1B --> P1C --> P1D
-    end
+    LH <-->|Original Load Balance| LE
+    LE -.->|Phase I temporary Hot Standby<br/>LE Active, NH Standby| NH
+    NH -.->|Phase II final Hot Standby<br/>NH Standby, NE Active| NE
 
-    subgraph P2[Phase II]
-        P2A[Run script on New EQB]
-        P2B[Create or load local Phase II baseline]
-        P2C[Detach temporary Legacy Edge relationship]
-        P2D[Retain leases on New EQB]
-        P2E[Create final Hot Standby to New Edge]
-        P2A --> P2B --> P2C --> P2D --> P2E
-    end
+    EDGEQUERY[Required management direction]
+    BLOCKED[Reverse direction may fail<br/>Not required for Phase I]
+    EDGEQUERY -->|PMUNSHDHCP01 to ALCEQADHCP02| LH
+    LH -. blocked or unreliable .-> BLOCKED
 ```
 
-### End State
+## Scope Placement by Stage
 
-After both phases complete successfully:
+```mermaid
+stateDiagram-v2
+    [*] --> OriginalLegacyFailover
+    OriginalLegacyFailover: Scope on PMUNSHDHCP01 and ALCEQADHCP02
+    OriginalLegacyFailover: Original mode is Load Balance or accepted Hot Standby
 
-- The legacy failover relationship no longer owns the migrated scope.
-- New EQB retains a complete copy of the scope, leases, and reservations.
-- New Edge has the replicated scope, leases, and reservations.
-- New EQB and New Edge participate in the uniquely named final Hot Standby relationship.
+    OriginalLegacyFailover --> DetachedOnLegacyEdge: Remove scope from original failover
+    DetachedOnLegacyEdge: Scope retained on PMUNSHDHCP01
+    DetachedOnLegacyEdge: Scope must be absent from ALCEQADHCP02
 
----
+    DetachedOnLegacyEdge --> TemporaryEQBFailoverEstablished: Create or reuse temporary Hot Standby
+    TemporaryEQBFailoverEstablished: PMUNSHDHCP01 Active
+    TemporaryEQBFailoverEstablished: ALCEQBDHCWP01 Standby
+
+    TemporaryEQBFailoverEstablished --> DetachedFromLegacyEdge: Phase II removes temporary failover membership
+    DetachedFromLegacyEdge: Scope retained on ALCEQBDHCWP01
+
+    DetachedFromLegacyEdge --> FinalNewEdgeFailoverEstablished: Create or reuse final Hot Standby
+    FinalNewEdgeFailoverEstablished: ALCEQBDHCWP01 Standby
+    FinalNewEdgeFailoverEstablished: ALCNSHDHCWP01 Active
+    FinalNewEdgeFailoverEstablished --> [*]
+```
+
+## Rev 2.4 Phase I Safety Flow
+
+```mermaid
+flowchart TD
+    A[Start Phase I on LegacyEdge] --> B{Local server equals CSV LegacyEdge?}
+    B -->|No| STOP1[Stop before DHCP changes]
+    B -->|Yes| C[Validate local DHCP service, ScopeId, and ScopeName]
+    C --> D[Detect Phase I resume state]
+    D --> E{Original legacy failover?}
+    E -->|Yes| F[From LegacyEdge, inventory LegacyHub scopes]
+    F --> G{Exactly one matching scope on LegacyHub?}
+    G -->|No or transport failure| STOP2[Stop before detach]
+    G -->|Yes| H[Capture leases and reservations from both legacy servers]
+    E -->|Detached or temporary state| I[Load saved baseline or use approved recovery path]
+    H --> J[Create scope recovery package]
+    I --> J
+    J --> K[Back up local LegacyEdge DHCP database]
+    K --> L{Original relationship still attached?}
+    L -->|Yes| M[Remove scope from original failover locally on LegacyEdge]
+    L -->|No| N[Skip detach as resumable state]
+    M --> O[Confirm scope remains on LegacyEdge]
+    N --> O
+    O --> P[Inventory LegacyHub scopes]
+    P --> Q{Scope absent from LegacyHub?}
+    Q -->|No or query fails| STOP3[Safety stop; do not create temporary relationship]
+    Q -->|Yes| R[Validate LegacyEdge leases against consolidated baseline]
+    R --> S[Create, reuse, or join temporary Hot Standby]
+    S --> T[Validate relationship and replicated leases on NewHub]
+    T --> U[Record PASS and evidence]
+```
+
+## Key Features
+
+- CSV-driven migration of multiple DHCP IPv4 scopes
+- Two-phase migration with explicit source and destination placement
+- Corrected `LegacyHub` and `LegacyEdge` semantics
+- Phase I local-execution enforcement on `LegacyEdge`
+- Required-direction management validation from Legacy Edge to Legacy Hub
+- Full Legacy Hub scope-inventory checks to distinguish an absent scope from a failed query
+- Explicit post-detach proof that the scope remains on Legacy Edge and is absent from Legacy Hub
+- Consolidated lease baseline from both legacy failover partners
+- Per-scope XML recovery export with leases
+- Lease and reservation CSV exports
+- Local DHCP database backup before relationship changes
+- Temporary and final Hot Standby creation or reuse
+- Relationship action controls: `Auto`, `Reuse`, and `Create`
+- Resume-state detection for partially completed migrations
+- Phase II local baseline recovery
+- Shared temporary and final relationship validation for a single server pair
+- Retry and replication handling when adding scopes to existing relationships
+- Approved zero-lease scope handling through `AllowZeroLeases`
+- Continue-to-next-row behavior by default
+- Optional batch stop through `-StopBatchOnRowError`
+- Timestamped logs, comparisons, exports, failure records, and summaries
+- `-PreflightOnly`, `-WhatIf`, and `-Confirm` support
 
 ## Requirements
 
-### Operating System and PowerShell
+### Platform
 
 - Windows Server with the DHCP Server role or DHCP management tools
 - Windows PowerShell 5.1
 - Elevated Administrator session
-- DHCP Server PowerShell module
-- Network and RPC/CIM connectivity between the participating DHCP servers
+- `DhcpServer` PowerShell module
 
 ### Permissions
 
 The operator account must be able to:
 
-- Read DHCP scopes, leases, reservations, and failover relationships
+- Read scopes, leases, reservations, and failover relationships
+- Query the Legacy Hub from the Legacy Edge
 - Back up the local DHCP database
+- Export individual scopes with leases
 - Remove scopes from failover relationships
 - Create failover relationships
-- Add scopes to an existing failover relationship
+- Add scopes to existing relationships
 - Trigger failover replication
-- Read event logs and service status
-- Write to the configured backup and output directories
+- Read local service status and event logs
+- Write to `BackupRoot` and `OutputRoot`
 
-### Operational Prerequisites
+### Network Path
 
-Before migration:
-
-- Confirm all server names resolve through DNS.
-- Confirm remote DHCP administration is permitted.
-- Confirm the target scope exists on the expected source server.
-- Confirm all active clients can tolerate the planned failover transition.
-- Confirm the backup destination has sufficient free space.
-- Confirm each final relationship name is unique for Phase II.
-- Schedule the migration under an approved change record.
-- Test the workflow in a nonproduction environment.
-
----
-
-## Files
-
-Place these files together in an operator staging directory such as `C:\Staging`:
+Phase I requires successful DHCP management calls in this direction:
 
 ```text
-C:\Staging\DHCP_Scope_Bulk_Migration_Rev1.0.ps1
-C:\Staging\DHCP_Scope_Bulk_Migration_Rev1.0.csv
+LegacyEdge -> LegacyHub
+PMUNSHDHCP01 -> ALCEQADHCP02
 ```
 
-The script does not require the files to be in `C:\Staging`, but all run examples in this documentation use that location.
-
----
+The script does not require `ALCEQADHCP02` to initiate remote DHCP management queries toward `PMUNSHDHCP01`. However, normal DHCP failover replication must work for any relationship being created or validated.
 
 ## CSV Format
 
-### Required Header
+### Header
 
 ```csv
-Enabled,Phase,ScopeId,ScopeName,LegacyHub,LegacyEdge,NewHub,NewEdge,ReservePercent,MCLT,TempRelationship,FinalRelationship,BackupRoot,OutputRoot,StopOnValidationFailure
+Enabled,Phase,ScopeId,ScopeName,LegacyHub,LegacyEdge,NewHub,NewEdge,ReservePercent,MCLT,TempRelationship,TempRelationshipAction,FinalRelationship,RelationshipAction,BackupRoot,OutputRoot,StopOnValidationFailure,AllowZeroLeases
 ```
 
-### Example Phase I CSV
-
-Use Phase `1` while running on the Legacy Edge DHCP server:
+### Nashville Phase I Example
 
 ```csv
-Enabled,Phase,ScopeId,ScopeName,LegacyHub,LegacyEdge,NewHub,NewEdge,ReservePercent,MCLT,TempRelationship,FinalRelationship,BackupRoot,OutputRoot,StopOnValidationFailure
-TRUE,1,192.168.10.0,MigrationTestScope1,LegacyHub01,LegacyEdge01,NewEQB01,NewEdge01,10,00:05:00,LegacyEdge-NewEQB-HS,EQB-NewEdge-Scope10-HS,C:\DHCPMigration\Backup,C:\DHCPMigration\Results,FALSE
-TRUE,1,192.168.20.0,MigrationTestScope2,LegacyHub01,LegacyEdge01,NewEQB01,NewEdge01,10,00:05:00,LegacyEdge-NewEQB-HS,EQB-NewEdge-Scope20-HS,C:\DHCPMigration\Backup,C:\DHCPMigration\Results,FALSE
+Enabled,Phase,ScopeId,ScopeName,LegacyHub,LegacyEdge,NewHub,NewEdge,ReservePercent,MCLT,TempRelationship,TempRelationshipAction,FinalRelationship,RelationshipAction,BackupRoot,OutputRoot,StopOnValidationFailure,AllowZeroLeases
+TRUE,1,10.90.151.0,TN-Nashville-NSH-Main-Pouch-Voice,ALCEQADHCP02,PMUNSHDHCP01,ALCEQBDHCWP01,ALCNSHDHCWP01,10,0:05:00,Migrate Temp NSH,Auto,NSH to EQB Active,Auto,C:\DHCPMigration\Backup,C:\DHCPMigration\Results,FALSE,TRUE
 ```
 
-### Example Phase II CSV
-
-Before running on New EQB, change the `Phase` value to `2` for every scope intended for Phase II:
+### Nashville Phase II Example
 
 ```csv
-Enabled,Phase,ScopeId,ScopeName,LegacyHub,LegacyEdge,NewHub,NewEdge,ReservePercent,MCLT,TempRelationship,FinalRelationship,BackupRoot,OutputRoot,StopOnValidationFailure
-TRUE,2,192.168.10.0,MigrationTestScope1,LegacyHub01,LegacyEdge01,NewEQB01,NewEdge01,10,00:05:00,LegacyEdge-NewEQB-HS,EQB-NewEdge-Scope10-HS,C:\DHCPMigration\Backup,C:\DHCPMigration\Results,FALSE
-TRUE,2,192.168.20.0,MigrationTestScope2,LegacyHub01,LegacyEdge01,NewEQB01,NewEdge01,10,00:05:00,LegacyEdge-NewEQB-HS,EQB-NewEdge-Scope20-HS,C:\DHCPMigration\Backup,C:\DHCPMigration\Results,FALSE
+Enabled,Phase,ScopeId,ScopeName,LegacyHub,LegacyEdge,NewHub,NewEdge,ReservePercent,MCLT,TempRelationship,TempRelationshipAction,FinalRelationship,RelationshipAction,BackupRoot,OutputRoot,StopOnValidationFailure,AllowZeroLeases
+TRUE,2,10.90.151.0,TN-Nashville-NSH-Main-Pouch-Voice,ALCEQADHCP02,PMUNSHDHCP01,ALCEQBDHCWP01,ALCNSHDHCWP01,10,0:05:00,Migrate Temp NSH,Auto,NSH to EQB Active,Auto,C:\DHCPMigration\Backup,C:\DHCPMigration\Results,FALSE,TRUE
 ```
-
-> **Critical:** Do not run rows marked Phase `1` on New EQB. Do not run rows marked Phase `2` on Legacy Edge. The script validates the local server and stops the affected row when execution occurs on the wrong server.
-
----
 
 ## CSV Column Reference
 
 ### `Enabled`
 
-Controls whether the row is imported for the current execution.
-
-Accepted true values:
-
-```text
-TRUE
-true
-1
-yes
-y
-```
-
-Set the value to `FALSE` to leave a row in the CSV without processing it.
+Controls whether the row is processed. Accepted true values are `TRUE`, `true`, `1`, `yes`, and `y`.
 
 ### `Phase`
 
-Controls which workflow is executed.
+- `1`: Legacy Edge to New Hub temporary relationship
+- `2`: New Hub to New Edge final relationship
 
-```text
-1 = Legacy Edge to New EQB temporary relationship
-2 = New EQB to New Edge final relationship
-```
-
-Phase placement:
-
-```text
-Phase 1 must run locally on LegacyEdge.
-Phase 2 must run locally on NewHub.
-```
+Phase I must run on `LegacyEdge`. Phase II must run on `NewHub`.
 
 ### `ScopeId`
 
-The IPv4 network address of the DHCP scope, not the friendly scope name and not an assignable client address.
-
-Correct examples:
-
-```text
-192.168.10.0
-10.40.12.0
-172.20.32.0
-```
-
-Incorrect examples:
-
-```text
-MigrationTestScope1
-192.168.10.100
-Scope-Users
-```
-
-The script validates that `ScopeId` is an IPv4 address and verifies the scope exists locally.
+IPv4 scope network address, such as `10.90.151.0`. Do not use a friendly name or assignable client address.
 
 ### `ScopeName`
 
-The exact friendly name displayed by the Windows DHCP console. Matching is case-insensitive, but spelling, spaces, punctuation, and numbering must otherwise match.
-
-Example:
-
-```text
-MigrationTestScope1
-```
-
-The script cross-checks `ScopeId` and `ScopeName` to prevent migration of the wrong scope.
+Exact friendly name displayed by Windows DHCP Manager. Comparison is case-insensitive, but spelling, spaces, punctuation, and numbering must match.
 
 ### `LegacyHub`
 
-The legacy centralized or hub DHCP server participating in the original failover relationship.
-
-Example:
-
-```text
-LegacyHub01
-```
-
-A short host name or FQDN can be used, but consistent naming is recommended.
+Original centralized partner that must no longer contain the scope after Phase I detach. For this wave, use `ALCEQADHCP02`.
 
 ### `LegacyEdge`
 
-The legacy Edge DHCP server on which Phase I must run. Phase I retains the scope and leases on this server after detaching the original failover relationship.
-
-Example:
-
-```text
-LegacyEdge01
-```
+Retained source server and required Phase I execution server. For this wave, use `PMUNSHDHCP01`.
 
 ### `NewHub`
 
-The new EQB DHCP server. This server is the temporary Phase I partner and the local execution server for Phase II.
-
-Example:
-
-```text
-NewEQB01
-```
+Temporary Phase I partner and required Phase II execution server. For this wave, use `ALCEQBDHCWP01`.
 
 ### `NewEdge`
 
-The final Edge DHCP partner created during Phase II.
-
-Example:
-
-```text
-NewEdge01
-```
+Final Edge partner. For this wave, use `ALCNSHDHCWP01`.
 
 ### `ReservePercent`
 
-The Hot Standby reserve percentage. The script accepts an integer from `1` through `50`.
-
-Example:
-
-```text
-10
-```
-
-Use the value approved by the DHCP design owner. Do not change this solely to bypass validation.
+Hot Standby reserve percentage from 1 through 50.
 
 ### `MCLT`
 
-Maximum Client Lead Time in a valid PowerShell `TimeSpan` format.
-
-Recommended format:
-
-```text
-00:05:00
-```
-
-Meaning:
-
-```text
-hours:minutes:seconds
-```
-
-Additional examples:
-
-```text
-01:00:00
-00:30:00
-```
-
-The value must be greater than zero.
+Maximum Client Lead Time in PowerShell `TimeSpan` format, such as `0:05:00` or `00:05:00`. The value must be greater than zero.
 
 ### `TempRelationship`
 
-Name of the temporary Phase I Hot Standby relationship between Legacy Edge and New EQB.
+Temporary relationship name between `LegacyEdge` and `NewHub`. Multiple scopes may share the name only when the same server pair is used.
 
-Multiple scopes may intentionally share this temporary relationship when all scopes use the same two temporary partner servers and settings.
+### `TempRelationshipAction`
 
-Example:
-
-```text
-LegacyEdge-NewEQB-HS
-```
-
-The script can create this relationship for the first scope and add later scopes to the existing relationship.
+- `Auto`: Reuse a matching relationship or create it if absent
+- `Reuse`: Require the relationship to exist
+- `Create`: Require the relationship name to be unused
 
 ### `FinalRelationship`
 
-Name of the final Phase II Hot Standby relationship between New EQB and New Edge.
+Final relationship name between `NewHub` and `NewEdge`. Rev 2.4 permits a shared final relationship across multiple scopes when all affected rows use the same server pair and compatible plan.
 
-**Each enabled Phase II row must have a unique final relationship name.**
+### `RelationshipAction`
 
-Correct:
-
-```text
-EQB-NewEdge-Scope10-HS
-EQB-NewEdge-Scope20-HS
-```
-
-Incorrect:
-
-```text
-EQB-NewEdge-HS
-EQB-NewEdge-HS
-```
-
-The script validates uniqueness before any Phase II DHCP changes. If the final name already exists, the script distinguishes among:
-
-- The intended scope is already assigned to the final relationship: resume and validate.
-- The scope is still assigned to the expected temporary relationship: continue Phase II.
-- The final relationship exists without the intended scope: recover by adding the scope when mode and partner match.
-- The scope is assigned to an unrelated relationship: stop that row as an unexpected collision.
+Controls final relationship behavior using `Auto`, `Reuse`, or `Create`.
 
 ### `BackupRoot`
 
-Local or accessible directory used for DHCP database backups.
-
-Example:
-
-```text
-C:\DHCPMigration\Backup
-```
-
-Backups are stored in timestamped subdirectories containing the local server and scope identifiers.
+Destination for local database backups and per-scope recovery packages.
 
 ### `OutputRoot`
 
-Directory used for run logs, lease exports, comparisons, summaries, and failure evidence.
-
-Example:
-
-```text
-C:\DHCPMigration\Results
-```
-
-Phase II creates server-local recovery baselines here when Phase I baseline files are unavailable on New EQB.
+Destination for run logs, baselines, lease comparisons, summaries, and failure evidence.
 
 ### `StopOnValidationFailure`
 
-Retained as a configuration and reporting field. The resumable workflow continues to later enabled rows after a row-level failure so an unrelated scope is not skipped.
+Backward-compatible row behavior. `TRUE` stops after a row failure. `FALSE` allows later enabled rows to continue unless `-StopBatchOnRowError` is supplied.
 
-Recommended value:
+### `AllowZeroLeases`
 
-```text
-FALSE
-```
+Set to `TRUE` only for a scope approved to contain zero leases. This does not bypass scope, relationship, backup, or placement checks.
 
----
+## Operator Runbook
 
-## Where to Run Each Phase
+### 1. Stage the files
 
-### Phase I
-
-Run on the server specified by the row's `LegacyEdge` value.
+Place the script and applicable CSV together, for example:
 
 ```text
-Execution server: LegacyEdge
-Source relationship: LegacyHub <-> LegacyEdge
-Temporary destination: LegacyEdge <-> NewHub
+C:\Staging\DHCP_Scope_Bulk_Migration_Rev2.4.ps1
+C:\Staging\DHCP_Wave4_Day1_P1_Rev2.4.csv
+C:\Staging\DHCP_Wave4_Day1_P2_Rev2.4.csv
 ```
 
-Example:
+### 2. Run Phase I preflight on PMUNSHDHCP01
 
 ```powershell
 Set-Location C:\Staging
 
-.\DHCP_Scope_Bulk_Migration_Rev1.0.ps1 `
-    -ConfigFile ".\DHCP_Scope_Bulk_Migration_Rev1.0.csv"
-```
-
-### Phase II
-
-Run on the server specified by the row's `NewHub` value.
-
-```text
-Execution server: NewHub, also referred to as New EQB
-Temporary relationship: LegacyEdge <-> NewHub
-Final destination: NewHub <-> NewEdge
-```
-
-Change the CSV rows to `Phase=2`, copy the script and CSV to New EQB, and run:
-
-```powershell
-Set-Location C:\Staging
-
-.\DHCP_Scope_Bulk_Migration_Rev1.0.ps1 `
-    -ConfigFile ".\DHCP_Scope_Bulk_Migration_Rev1.0.csv"
-```
-
----
-
-## Recommended Operator Runbook
-
-### 1. Prepare and validate the CSV
-
-- Populate one row per scope.
-- Use the scope network address in `ScopeId`.
-- Match the exact DHCP display name in `ScopeName`.
-- Verify all four server columns.
-- Use a common `TempRelationship` only when intended.
-- Assign a unique `FinalRelationship` to every Phase II row.
-- Set `Phase=1` before the first execution.
-- Set `Enabled=TRUE` only for scopes in the approved change.
-
-### 2. Run Phase I preflight on Legacy Edge
-
-```powershell
-.\DHCP_Scope_Bulk_Migration_Rev1.0.ps1 `
-    -ConfigFile ".\DHCP_Scope_Bulk_Migration_Rev1.0.csv" `
+.\DHCP_Scope_Bulk_Migration_Rev2.4.ps1 `
+    -ConfigFile .\DHCP_Wave4_Day1_P1_Rev2.4.csv `
     -PreflightOnly
 ```
 
-Review the output and evidence folder. Preflight validates state but does not perform the migration changes.
+Review the log and confirm that:
+
+- The local execution server is `PMUNSHDHCP01`.
+- The scope ID and name match.
+- The original partner is `ALCEQADHCP02`.
+- Legacy Edge to Legacy Hub management validation passes.
+- Scope and lease baselines are captured successfully.
 
 ### 3. Run Phase I
 
 ```powershell
-.\DHCP_Scope_Bulk_Migration_Rev1.0.ps1 `
-    -ConfigFile ".\DHCP_Scope_Bulk_Migration_Rev1.0.csv"
+.\DHCP_Scope_Bulk_Migration_Rev2.4.ps1 `
+    -ConfigFile .\DHCP_Wave4_Day1_P1_Rev2.4.csv
 ```
 
-Do not proceed to Phase II until every intended scope has a successful Phase I result or the failure has been reviewed and safely resumed.
+Phase I will not create the temporary relationship until the script proves that the scope remains on `PMUNSHDHCP01` and is absent from `ALCEQADHCP02`.
 
 ### 4. Verify Phase I
+
+Run locally on `PMUNSHDHCP01`:
 
 ```powershell
 Get-DhcpServerv4Failover |
     Format-Table Name, Mode, PartnerServer, ScopeId -AutoSize
 ```
 
-Verify lease counts on Legacy Edge and New EQB:
+Verify placement for a scope:
 
 ```powershell
-foreach ($ScopeId in '192.168.10.0','192.168.20.0') {
-    [pscustomobject]@{
-        ScopeId = $ScopeId
-        LegacyEdgeLeases = @(Get-DhcpServerv4Lease -ComputerName 'LegacyEdge01' -ScopeId $ScopeId -AllLeases).Count
-        NewEQBLeases = @(Get-DhcpServerv4Lease -ComputerName 'NewEQB01' -ScopeId $ScopeId -AllLeases).Count
-    }
+$scopeId = '10.90.151.0'
+
+[pscustomobject]@{
+    ScopeId            = $scopeId
+    LegacyEdgePresent  = [bool](Get-DhcpServerv4Scope -ComputerName 'PMUNSHDHCP01' -ScopeId $scopeId -ErrorAction SilentlyContinue)
+    LegacyHubPresent   = [bool](Get-DhcpServerv4Scope -ComputerName 'ALCEQADHCP02' -ScopeId $scopeId -ErrorAction SilentlyContinue)
+    LegacyEdgeLeases   = @(Get-DhcpServerv4Lease -ComputerName 'PMUNSHDHCP01' -ScopeId $scopeId -AllLeases).Count
+    NewHubLeases       = @(Get-DhcpServerv4Lease -ComputerName 'ALCEQBDHCWP01' -ScopeId $scopeId -AllLeases).Count
 }
 ```
 
-### 5. Prepare Phase II
+Expected Phase I placement:
 
-- Change the intended rows from `Phase=1` to `Phase=2`.
-- Confirm `FinalRelationship` values are unique.
-- Copy the script and updated CSV to New EQB.
-- Do not manually remove the temporary relationship merely because Phase II has not run yet.
+```text
+PMUNSHDHCP01: scope present
+ALCEQADHCP02: scope absent
+ALCEQBDHCWP01: replicated temporary copy present
+```
 
-### 6. Run Phase II preflight on New EQB
+### 5. Run Phase II preflight on ALCEQBDHCWP01
 
 ```powershell
-.\DHCP_Scope_Bulk_Migration_Rev1.0.ps1 `
-    -ConfigFile ".\DHCP_Scope_Bulk_Migration_Rev1.0.csv" `
+Set-Location C:\Staging
+
+.\DHCP_Scope_Bulk_Migration_Rev2.4.ps1 `
+    -ConfigFile .\DHCP_Wave4_Day1_P2_Rev2.4.csv `
     -PreflightOnly
 ```
 
-### 7. Run Phase II
+### 6. Run Phase II
 
 ```powershell
-.\DHCP_Scope_Bulk_Migration_Rev1.0.ps1 `
-    -ConfigFile ".\DHCP_Scope_Bulk_Migration_Rev1.0.csv"
+.\DHCP_Scope_Bulk_Migration_Rev2.4.ps1 `
+    -ConfigFile .\DHCP_Wave4_Day1_P2_Rev2.4.csv
 ```
 
-### 8. Verify final state
+### 7. Verify the final state
+
+Run locally on `ALCEQBDHCWP01`:
 
 ```powershell
 Get-DhcpServerv4Failover |
     Format-Table Name, Mode, ServerRole, PartnerServer, ScopeId -AutoSize
 ```
 
-Verify lease counts on New EQB and New Edge:
+Expected final placement:
 
-```powershell
-foreach ($ScopeId in '192.168.10.0','192.168.20.0') {
-    [pscustomobject]@{
-        ScopeId = $ScopeId
-        NewEQBLeases = @(Get-DhcpServerv4Lease -ComputerName 'NewEQB01' -ScopeId $ScopeId -AllLeases).Count
-        NewEdgeLeases = @(Get-DhcpServerv4Lease -ComputerName 'NewEdge01' -ScopeId $ScopeId -AllLeases).Count
-    }
-}
+```text
+ALCEQBDHCWP01: scope present, Standby role
+ALCNSHDHCWP01: scope present, Active role
+PMUNSHDHCP01: no longer the final failover partner
+ALCEQADHCP02: scope absent
 ```
 
----
-
-## Detailed Workflow
+## Detailed End-to-End Workflow
 
 ```mermaid
 flowchart TD
     A[Start elevated Windows PowerShell 5.1] --> B[Import enabled CSV rows]
-    B --> C[Validate required columns and values]
-    C --> D{Any duplicate Phase and ScopeId rows?}
-    D -->|Yes| E[Stop before migration]
-    D -->|No| F{Any Phase II rows?}
-    F -->|Yes| G[Validate unique FinalRelationship names]
-    G --> H[Inspect existing final names and scope assignments]
-    H --> I{Relationship state acceptable?}
-    I -->|Unexpected collision| E
-    I -->|Temporary, final, or detached| J[Continue]
-    F -->|No| J
-    J --> K[Process each enabled row]
-    K --> L{Phase}
+    B --> C[Validate columns, values, duplicate phase and scope rows]
+    C --> D[Validate shared relationship plans]
+    D --> E{Rows contain Phase II?}
+    E -->|Yes| F[Require local NewHub and validate Phase II plan]
+    E -->|No| G[Process enabled rows]
+    F --> G
+    G --> H{Phase}
 
-    L -->|Phase I| P1A[Require local server equals LegacyEdge]
-    P1A --> P1B[Validate scope ID and name]
-    P1B --> P1C{Detect Phase I state}
-    P1C -->|Original legacy failover| P1D[Capture Legacy Edge and Legacy Hub baseline]
-    P1C -->|Already detached| P1E[Load saved baseline or create recovery baseline from Legacy Edge]
-    P1C -->|Temporary EQB already established| P1F[Load baseline and validate]
-    P1D --> P1G[Backup Legacy Edge DHCP]
-    P1E --> P1G
-    P1F --> P1G
-    P1G --> P1H{Original relationship still attached?}
-    P1H -->|Yes| P1I[Remove scope from original failover]
-    P1H -->|No| P1J[Skip detach]
-    P1I --> P1K[Validate leases retained on Legacy Edge]
-    P1J --> P1K
-    P1K --> P1L{Temporary relationship exists?}
-    P1L -->|No| P1M[Create temporary Hot Standby]
-    P1L -->|Yes, scope absent| P1N[Add scope to temporary relationship]
-    P1L -->|Yes, scope present| P1O[Reuse relationship]
-    P1M --> P1P[Validate relationship and EQB leases]
-    P1N --> P1P
-    P1O --> P1P
-    P1P --> R[Record row result and evidence]
+    H -->|Phase I| I1[Require local server equals LegacyEdge]
+    I1 --> I2[Validate DHCP service, ScopeId, and ScopeName]
+    I2 --> I3[Detect original, detached, or temporary state]
+    I3 --> I4{Original legacy relationship?}
+    I4 -->|Yes| I5[From LegacyEdge, confirm scope exists on LegacyHub]
+    I5 --> I6[Capture consolidated leases and reservations]
+    I4 -->|No| I7[Load baseline or approved recovery baseline]
+    I6 --> I8[Create per-scope recovery package]
+    I7 --> I8
+    I8 --> I9[Back up LegacyEdge DHCP database]
+    I9 --> I10[Detach original relationship if still attached]
+    I10 --> I11[Confirm scope retained on LegacyEdge]
+    I11 --> I12[Confirm scope absent from LegacyHub]
+    I12 --> I13[Validate leases against baseline]
+    I13 --> I14[Create, reuse, or join temporary Hot Standby]
+    I14 --> I15[Validate relationship and NewHub leases]
+    I15 --> R[Record row result and evidence]
 
-    L -->|Phase II| P2A[Require local server equals NewHub]
-    P2A --> P2B[Validate local EQB scope]
-    P2B --> P2C{Detect Phase II state}
-    P2C -->|Temporary relationship| P2D[Resume from temporary Legacy Edge partnership]
-    P2C -->|Detached| P2E[Resume after temporary detach]
-    P2C -->|Final relationship| P2F[Resume completed final relationship]
-    P2D --> P2G[Load or create local Phase II baseline]
-    P2E --> P2G
-    P2F --> P2G
-    P2G --> P2H[Validate EQB leases]
-    P2H --> P2I[Backup New EQB DHCP]
-    P2I --> P2J{Temporary relationship still attached?}
-    P2J -->|Yes| P2K[Remove scope from temporary relationship]
-    P2J -->|No| P2L[Skip detach]
-    P2K --> P2M[Validate leases retained on New EQB]
-    P2L --> P2M
-    P2M --> P2N{Final relationship state}
-    P2N -->|Absent| P2O[Create final Hot Standby]
-    P2N -->|Relationship exists, scope absent| P2P[Add scope to existing final relationship]
-    P2N -->|Scope already assigned| P2Q[Reuse final relationship]
-    P2O --> P2R[Validate final relationship and New Edge leases]
-    P2P --> P2R
-    P2Q --> P2R
-    P2R --> R
+    H -->|Phase II| P1[Require local server equals NewHub]
+    P1 --> P2[Validate local NewHub scope]
+    P2 --> P3[Detect temporary, detached, or final state]
+    P3 --> P4[Load or create local Phase II baseline]
+    P4 --> P5[Validate NewHub leases]
+    P5 --> P6[Validate relationship plan and roles]
+    P6 --> P7[Back up NewHub DHCP database]
+    P7 --> P8[Detach temporary relationship if attached]
+    P8 --> P9[Validate leases retained on NewHub]
+    P9 --> P10[Create, reuse, or join final Hot Standby]
+    P10 --> P11[Validate roles, relationship, leases, reservations, and local health]
+    P11 --> R
 
     R --> S{More enabled rows?}
-    S -->|Yes| K
+    S -->|Yes| G
     S -->|No| T[Export MigrationSummary.csv and finish]
 ```
 
----
+## Outputs and Evidence
 
-## Outputs
-
-Each run creates a timestamped directory under `OutputRoot`:
+Each execution creates a timestamped directory:
 
 ```text
 C:\DHCPMigration\Results\Run_YYYYMMDD_HHMMSS
@@ -622,85 +472,71 @@ FAILURE.txt
 
 Per-scope evidence can include:
 
-- Lease exports before and after detach
+- Legacy Edge and Legacy Hub lease exports
 - Reservation exports
-- Consolidated baselines
-- Local Phase II baselines
-- Lease comparison CSV files
-- Temporary and final failover relationship details
+- Consolidated lease baselines
+- Phase II local baselines
+- Before-and-after lease comparisons
+- Temporary and final relationship details
+- DHCP database settings
 - Scope statistics
 - Recent warning and error events
-- Database settings
+- Per-scope recovery package manifest and hashes
 
-Backups are written below `BackupRoot` using a pattern similar to:
+## Resume States
 
-```text
-DHCP_<LocalServer>_<ScopeId>_YYYYMMDD_HHMMSS
-```
+### Phase I
 
----
+- `OriginalLegacyFailover`: Original Load Balance or accepted Hot Standby relationship is present with the configured Legacy Hub.
+- `Detached`: No scope failover relationship is present. The retained Legacy Edge is authoritative.
+- `TemporaryEQBFailoverEstablished`: Expected temporary Hot Standby relationship already exists between Legacy Edge and New Hub.
 
-## Resume Behavior
+### Phase II
 
-### Phase I states
+- `TemporaryLegacyEdgeFailover`: Scope remains in the expected temporary relationship.
+- `DetachedFromLegacyEdge`: Temporary relationship has already been removed and the scope is retained on New Hub.
+- `FinalNewEdgeFailoverEstablished`: Expected final relationship already exists between New Hub and New Edge.
 
-- `OriginalLegacyFailover`: Original Load Balance relationship is still present.
-- `Detached`: Original relationship was already removed.
-- `TemporaryEQBFailoverEstablished`: Temporary Legacy Edge and New EQB relationship already exists.
-
-### Phase II states
-
-- `TemporaryLegacyEdgeFailover`: Scope is still in the expected temporary relationship.
-- `DetachedFromLegacyEdge`: Temporary scope relationship was already removed.
-- `FinalNewEdgeFailoverEstablished`: Final New EQB and New Edge relationship is already present.
-
-The script treats these states as resumable. An unexpected relationship name, mode, or partner is treated as a safety exception.
-
----
+Unexpected relationship names, modes, partners, or roles cause a safety stop for the affected row.
 
 ## Troubleshooting
 
-### Script says it is running on the wrong server
+### Phase I reports the wrong execution server
 
-Verify the CSV phase and execution host:
-
-```text
-Phase 1 -> run on LegacyEdge
-Phase 2 -> run on NewHub
-```
-
-### Scope ID and scope name do not match
-
-Open DHCP Manager and copy:
-
-- The scope network address into `ScopeId`
-- The displayed scope name into `ScopeName`
-
-### Phase II baseline does not exist
-
-This is expected when Phase II runs on a different server and the Phase I output was not copied. The script creates:
+Confirm:
 
 ```text
-Phase2Baseline_<ScopeId>.csv
+LegacyHub  = ALCEQADHCP02
+LegacyEdge = PMUNSHDHCP01
 ```
 
-from leases retained locally on New EQB before making Phase II changes.
+Run Phase I on `PMUNSHDHCP01`, not `ALCEQADHCP02`.
 
-### Duplicate final relationship names
+### Legacy Hub query fails before detach
 
-Assign a distinct `FinalRelationship` to each enabled Phase II scope. Do not reuse the same final name across rows.
+The required path from `PMUNSHDHCP01` to `ALCEQADHCP02` is unavailable. The script stops before making DHCP changes. Do not bypass this check because the script must capture the consolidated source baseline and later prove removal from the Legacy Hub.
 
-### Scope is still in the temporary relationship
+### Partner state is Not available or Unknown
 
-This is an expected Phase II starting state. Do not remove it manually. The script validates the baseline and backup before removing the scope.
+Asymmetric partner-status visibility is expected in the known firewall condition. The script does not rely exclusively on the remote partner-status display. Scope presence, failover membership, lease replication, server role, and lease baseline checks are used as authoritative validations where applicable.
 
-### Final relationship exists but scope is absent
+A failure of a required management command remains a hard stop. Rev 2.4 does not convert transport failures into successful validation.
 
-The script verifies mode and partner, then attempts to add the intended scope to the existing final relationship.
+### Scope remains on ALCEQADHCP02 after detach
 
-### One row fails and later rows continue
+The script stops before creating the temporary relationship. Review the failure records and DHCP state. Do not manually continue to Phase II.
 
-This is intentional. Review:
+### Scope exists locally but direct remote `-ScopeId` lookup says it is unavailable
+
+Rev 2.4 uses a full Legacy Hub scope inventory for placement checks. A successful inventory with no matching scope proves absence. A failed inventory call indicates a transport or permission problem and stops the row.
+
+### No leases are present
+
+Set `AllowZeroLeases=TRUE` only when the empty scope is expected and approved. Recovery XML, scope configuration, reservation evidence, and placement checks still apply.
+
+### A row fails and later rows continue
+
+This is the default behavior. Review:
 
 ```text
 MigrationSummary.csv
@@ -709,39 +545,52 @@ FAILURE.txt
 Migration.log
 ```
 
-Correct the condition and rerun. Successfully completed scopes should be detected as resumable or completed.
-
-### `State` or `RelationshipState` is unavailable
-
-Some DHCP module versions do not expose both properties consistently. The script checks available properties and continues to authoritative scope and lease validation when the relationship exists on both partners.
-
----
+Use `-StopBatchOnRowError` when the entire batch must stop after the first failed row.
 
 ## Safety and Change Control
 
-- Always run from an elevated session.
-- Use `-PreflightOnly` before production changes.
-- Use `-WhatIf` as an additional review mechanism, but remember that some read-only validation still runs.
-- Never delete scopes or relationship objects manually merely to make the script continue.
-- Review failure evidence before rerunning.
-- Protect logs and exports because they contain infrastructure names, IP networks, DHCP client IDs, host names, and lease information.
-- Retain backups and run evidence according to organizational policy.
-- Test rollback procedures before production use.
-
----
+- Run from an elevated Windows PowerShell 5.1 session.
+- Run `-PreflightOnly` before each production phase.
+- Use the matching Phase I and Phase II CSV files.
+- Never run Phase I from `ALCEQADHCP02` for this migration wave.
+- Do not manually delete scopes or failover relationships to force progress.
+- Do not suppress required Legacy Edge to Legacy Hub management failures.
+- Review backups, recovery exports, baselines, and failure evidence before rerunning.
+- Protect logs and exports because they contain infrastructure names, networks, DHCP client identifiers, host names, and lease data.
+- Retain evidence according to organizational change-control and data-retention requirements.
 
 ## Release Notes
 
-### Rev 1.0
+### Rev 2.4
 
-- Two-phase DHCP scope migration
-- CSV-driven multi-scope operation
-- Original, detached, temporary, and final relationship resume states
-- Local Phase II baseline recovery
-- Unique final relationship validation
-- Existing relationship and scope recovery
-- Lease and reservation evidence
-- DHCP backups
-- Per-row continuation and failure records
-- Detailed operator logging
+- Corrected the Nashville CSV mapping so `ALCEQADHCP02` is `LegacyHub` and `PMUNSHDHCP01` is `LegacyEdge`.
+- Anchored Phase I execution to the server that must retain the scope.
+- Added Legacy Edge to Legacy Hub management-direction validation before detach.
+- Added full Legacy Hub scope-inventory lookup to distinguish absence from query failure.
+- Added post-detach proof that the scope remains on Legacy Edge.
+- Added post-detach proof that the scope is absent from Legacy Hub.
+- Added a safety stop that prevents temporary relationship creation if the scope remains on Legacy Hub or placement cannot be verified.
+- Documented the asymmetric firewall and partner-status condition.
+- Preserved lease baselines, recovery exports, backups, retry behavior, relationship validation, and resumability.
 
+### Rev 2.3
+
+- Phase II creates New Hub as Standby and New Edge as Active.
+- Added final role validation.
+
+### Rev 2.2
+
+- Continue-on-row-error is enabled by default.
+- Supports `ContinueOnError`, `ContinueOnErrors`, and backward-compatible row controls.
+
+### Rev 2.1
+
+- Added flexible source states, shared relationships, relationship retries, replication attempts, and configurable row delays.
+
+### Rev 1.7
+
+- Added explicitly approved zero-lease scope handling.
+
+### Rev 1.6
+
+- Added robust lease capture, per-scope recovery exports, and validated replication.
